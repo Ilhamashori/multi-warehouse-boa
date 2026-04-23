@@ -1,0 +1,30 @@
+# Secrets - JANGAN COMMIT!
+.streamlit/secrets.toml
+*.json
+!package.json
+credentials*.json
+service_account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output/temp
+output/
+*.log
+temp/
