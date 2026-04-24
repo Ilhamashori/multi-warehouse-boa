@@ -120,5 +120,5 @@ Kolom lain boleh ada, akan ikut kebawa ke output.
 
 ## 📝 Credits
 
-Made for **Beauty of Angel** brand.
+Made for **Beauty of Angel by Mashori** brand.
 Powered by RajaOngkir V2 (Komerce) API + Streamlit + Google Sheets.
