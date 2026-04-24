@@ -17,7 +17,7 @@ from modules.rajaongkir import RajaOngkirAPI
 API_KEY = os.getenv("RAJAONGKIR_KEY", "PASTE_API_KEY_KAMU_DI_SINI")
 
 WAREHOUSES = [
-    {"kode": "G01", "nama": "Tangerang",     "zip": "15811"},
+    {"kode": "G01", "nama": "Tangerang",     "zip": "15810"},
     {"kode": "G02", "nama": "Medan",         "zip": "20212"},
     {"kode": "G03", "nama": "Makassar",      "zip": "90111"},
     {"kode": "G04", "nama": "Ambon/Maluku",  "zip": "97124"},

@@ -1,6 +1,5 @@
 """
-RajaOngkir API V2 (via Komerce) wrapper
-Base URL: https://rajaongkir.komerce.id/api/v1
+RajaOngkir API V2 (via Komerce) wrapper — DENGAN CACHE
 """
 import requests
 import time
@@ -16,46 +15,39 @@ class RajaOngkirAPI:
         self.api_key = api_key
         self.timeout = timeout
         self.headers = {"key": api_key}
+        # Cache in-memory
+        self._cache_destination = {}  # keyword -> list of destinations
+        self._cache_cost = {}  # (origin_id, dest_id, weight, couriers) -> services
+        # Counter buat monitoring
+        self.hits = 0
+        self.cache_hits = 0
 
     def search_destination(self, keyword: str, limit: int = 10) -> list:
-        """
-        Cari destination (kecamatan) berdasarkan keyword.
-        Keyword bisa nama kota, kecamatan, atau kode pos.
+        cache_key = f"{keyword.lower().strip()}_{limit}"
+        if cache_key in self._cache_destination:
+            self.cache_hits += 1
+            return self._cache_destination[cache_key]
 
-        Returns: list of dict, tiap dict berisi id, label, kelurahan, kecamatan, kota, provinsi, kode_pos
-        """
         url = f"{self.BASE_URL}/destination/domestic-destination"
         params = {"search": keyword, "limit": limit, "offset": 0}
-
         try:
             r = requests.get(url, headers=self.headers, params=params, timeout=self.timeout)
+            self.hits += 1
             r.raise_for_status()
             payload = r.json()
-            return payload.get("data", []) or []
+            result = payload.get("data", []) or []
+            self._cache_destination[cache_key] = result
+            return result
         except requests.exceptions.RequestException as e:
             print(f"[RajaOngkir] Error search_destination({keyword}): {e}")
             return []
 
-    def calculate_cost(
-        self,
-        origin_id: int,
-        destination_id: int,
-        weight_gram: int,
-        couriers: str = "jne:tiki",
-        price_sort: str = "lowest",
-    ) -> list:
-        """
-        Hitung ongkir dari origin ke destination.
+    def calculate_cost(self, origin_id, destination_id, weight_gram, couriers="jne:tiki", price_sort="lowest") -> list:
+        cache_key = (int(origin_id), int(destination_id), int(weight_gram), couriers, price_sort)
+        if cache_key in self._cache_cost:
+            self.cache_hits += 1
+            return self._cache_cost[cache_key]
 
-        Args:
-            origin_id: subdistrict_id gudang asal
-            destination_id: subdistrict_id tujuan
-            weight_gram: berat dalam gram
-            couriers: kurir yg dicek, pisah titik dua. Contoh: "jne:tiki"
-            price_sort: "lowest" atau "highest"
-
-        Returns: list of dict, tiap dict: name, code, service, description, cost, etd
-        """
         url = f"{self.BASE_URL}/calculate/domestic-cost"
         data = {
             "origin": str(origin_id),
@@ -65,34 +57,39 @@ class RajaOngkirAPI:
             "price": price_sort,
         }
         headers = {**self.headers, "Content-Type": "application/x-www-form-urlencoded"}
-
         try:
             r = requests.post(url, headers=headers, data=data, timeout=self.timeout)
+            self.hits += 1
             r.raise_for_status()
             payload = r.json()
-            return payload.get("data", []) or []
+            result = payload.get("data", []) or []
+            self._cache_cost[cache_key] = result
+            return result
         except requests.exceptions.RequestException as e:
             print(f"[RajaOngkir] Error calculate_cost({origin_id}->{destination_id}): {e}")
             return []
 
     def find_destination_by_zip(self, zip_code: str) -> Optional[dict]:
-        """
-        Shortcut: cari destination berdasarkan kode pos.
-        Return destination pertama yang cocok atau None.
-        """
         results = self.search_destination(str(zip_code), limit=5)
         if not results:
             return None
-        # Filter yang kode pos-nya persis cocok
         for r in results:
             if str(r.get("zip_code")) == str(zip_code):
                 return r
-        # Kalau nggak ada yang persis, return yang pertama
         return results[0]
+
+    def get_stats(self) -> dict:
+        total = self.hits + self.cache_hits
+        saved_pct = (self.cache_hits / total * 100) if total > 0 else 0
+        return {
+            "api_hits": self.hits,
+            "cache_hits": self.cache_hits,
+            "total_calls": total,
+            "hemat_pct": round(saved_pct, 1),
+        }
 
 
 def safe_request_with_retry(func, *args, max_retry: int = 2, delay: float = 1.0, **kwargs):
-    """Helper untuk retry request yang gagal (rate limit, network hiccup)."""
     for attempt in range(max_retry + 1):
         result = func(*args, **kwargs)
         if result:

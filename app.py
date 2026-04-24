@@ -13,7 +13,6 @@ from modules.gsheets import GSheetsClient
 from modules.shipping import process_all_orders
 
 
-# ===== PAGE CONFIG =====
 st.set_page_config(
     page_title="Multi Gudang - BoA",
     page_icon="📦",
@@ -22,10 +21,8 @@ st.set_page_config(
 )
 
 
-# ===== CACHED RESOURCES =====
 @st.cache_resource
 def get_gsheets_client():
-    """Inisialisasi GSheets client sekali aja (cached)."""
     creds = dict(st.secrets["gcp_service_account"])
     sheet_id = st.secrets["gsheets"]["spreadsheet_id"]
     return GSheetsClient(creds, sheet_id)
@@ -33,16 +30,14 @@ def get_gsheets_client():
 
 @st.cache_resource
 def get_rajaongkir_api():
-    """Inisialisasi RajaOngkir API sekali aja (cached)."""
     key = st.secrets["rajaongkir"]["api_key"]
     return RajaOngkirAPI(key)
 
 
-@st.cache_data(ttl=300)  # cache 5 menit
+@st.cache_data(ttl=300)
 def load_master_gudang():
     gs = get_gsheets_client()
     df = gs.read_sheet("master_gudang")
-    # Normalisasi tipe
     if "aktif" in df.columns:
         df["aktif"] = df["aktif"].apply(lambda x: str(x).upper() == "TRUE" or x is True)
     for col in ["subdistrict_id", "prioritas"]:
@@ -61,22 +56,17 @@ def load_config():
     return dict(zip(df["key"], df["value"]))
 
 
-# ===== HELPER =====
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Convert DataFrame ke bytes Excel buat download."""
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Hasil")
     return buf.getvalue()
 
 
-# ===== MAIN APP =====
 def main_app():
-    # Header
     st.title("📦 Multi Gudang - Beauty of Angel")
     st.caption("Pengelompokan order berdasarkan gudang termurah")
 
-    # Sidebar
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.get('username', 'User')}**")
         st.markdown("---")
@@ -92,7 +82,6 @@ def main_app():
         except Exception as e:
             st.error(f"❌ Error load gudang: {e}")
 
-    # Load config
     try:
         config = load_config()
         default_weight = int(config.get("default_berat_gram", 1000))
@@ -102,49 +91,33 @@ def main_app():
         default_weight = 1000
         couriers = "jne:tiki"
 
-    # ===== TAB =====
     tab1, tab2, tab3 = st.tabs(["📤 Upload & Proses", "📋 Riwayat", "⚙️ Pengaturan"])
 
-    # ===== TAB 1: UPLOAD =====
     with tab1:
         st.markdown("### 1. Upload File Excel Order")
-
         col1, col2 = st.columns([2, 1])
         with col1:
-            uploaded = st.file_uploader(
-                "Pilih file Excel (.xlsx)",
-                type=["xlsx"],
-                help="Format sama seperti Excel order dari Mengantar",
-            )
+            uploaded = st.file_uploader("Pilih file Excel (.xlsx)", type=["xlsx"])
         with col2:
-            weight_input = st.number_input(
-                "Berat per order (gram)",
-                min_value=100,
-                max_value=50000,
-                value=default_weight,
-                step=100,
-            )
+            weight_input = st.number_input("Berat per order (gram)", 100, 50000, default_weight, 100)
 
         if uploaded:
             try:
                 df_orders = pd.read_excel(uploaded)
-                st.success(f"✅ File loaded: **{len(df_orders)} order**")
+                st.success(f"✅ File loaded: **{len(df_orders)} baris**")
 
                 with st.expander("👀 Preview 5 baris pertama"):
                     st.dataframe(df_orders.head(), use_container_width=True)
 
                 st.markdown("### 2. Proses Pengelompokan")
-
                 if st.button("🚀 Mulai Proses", type="primary", use_container_width=True):
                     api = get_rajaongkir_api()
                     warehouses = load_master_gudang()
                     warehouses_aktif = warehouses[warehouses["aktif"] == True]
-
                     if warehouses_aktif.empty:
-                        st.error("❌ Tidak ada gudang aktif di master_gudang!")
+                        st.error("❌ Tidak ada gudang aktif!")
                         st.stop()
 
-                    # Progress bar
                     progress_bar = st.progress(0.0)
                     status_text = st.empty()
 
@@ -161,38 +134,21 @@ def main_app():
                             couriers=couriers,
                             progress_callback=update_progress,
                         )
-
                     progress_bar.empty()
                     status_text.empty()
 
-                    # Simpan ke session state biar nggak hilang
                     st.session_state.last_result = result
                     st.session_state.last_filename = uploaded.name
-
                     st.success("✅ Proses selesai!")
 
-                # Tampilkan hasil kalau ada
                 if "last_result" in st.session_state:
-                    result = st.session_state.last_result
-                    show_results(result, st.session_state.last_filename, couriers, weight_input)
-
+                    show_results(st.session_state.last_result, st.session_state.last_filename, couriers, weight_input)
             except Exception as e:
-                st.error(f"❌ Error baca file: {e}")
+                st.error(f"❌ Error: {e}")
 
-    # ===== TAB 2: RIWAYAT =====
     with tab2:
-        st.markdown("### 📋 Riwayat Upload")
-        try:
-            gs = get_gsheets_client()
-            df_log = gs.read_sheet("log_upload")
-            if df_log.empty:
-                st.info("Belum ada riwayat upload.")
-            else:
-                st.dataframe(df_log.sort_values(by="timestamp", ascending=False), use_container_width=True)
-        except Exception as e:
-            st.error(f"Error: {e}")
+        show_history_tab()
 
-    # ===== TAB 3: PENGATURAN =====
     with tab3:
         st.markdown("### ⚙️ Pengaturan")
         try:
@@ -200,22 +156,102 @@ def main_app():
             st.markdown("#### Config Saat Ini:")
             for k, v in config.items():
                 st.text(f"{k} = {v}")
-
             st.markdown("---")
             st.markdown("#### Master Gudang:")
             wh = load_master_gudang()
             st.dataframe(wh, use_container_width=True)
         except Exception as e:
             st.error(f"Error: {e}")
-
         if st.button("🔄 Refresh Cache"):
             st.cache_data.clear()
             st.success("Cache cleared!")
             st.rerun()
 
 
+def show_history_tab():
+    """Tab Riwayat dengan fitur hapus."""
+    st.markdown("### 📋 Riwayat Upload")
+
+    try:
+        gs = get_gsheets_client()
+        df_log = gs.read_sheet("log_upload")
+        if df_log.empty:
+            st.info("Belum ada riwayat upload.")
+            return
+
+        df_log = df_log.sort_values(by="timestamp", ascending=False).reset_index(drop=True)
+
+        # Header kolom
+        col_headers = st.columns([2, 1.5, 2.5, 1, 1, 1, 2, 1])
+        col_headers[0].markdown("**Timestamp**")
+        col_headers[1].markdown("**User**")
+        col_headers[2].markdown("**File**")
+        col_headers[3].markdown("**Order**")
+        col_headers[4].markdown("**Berhasil**")
+        col_headers[5].markdown("**Review**")
+        col_headers[6].markdown("**Sheet**")
+        col_headers[7].markdown("**Aksi**")
+        st.divider()
+
+        for idx, row in df_log.iterrows():
+            sheet_name = str(row.get("sheet_hasil", ""))
+            timestamp = str(row.get("timestamp", ""))
+
+            cols = st.columns([2, 1.5, 2.5, 1, 1, 1, 2, 1])
+            cols[0].text(timestamp)
+            cols[1].text(str(row.get("user", "")))
+            cols[2].text(str(row.get("nama_file", ""))[:30])
+            cols[3].text(str(row.get("jumlah_order", "")))
+            cols[4].text(str(row.get("berhasil", "")))
+            cols[5].text(str(row.get("review_manual", "")))
+            cols[6].text(sheet_name)
+
+            # Tombol hapus per baris
+            confirm_key = f"confirm_delete_{idx}"
+            if confirm_key not in st.session_state:
+                st.session_state[confirm_key] = False
+
+            with cols[7]:
+                if not st.session_state[confirm_key]:
+                    if st.button("🗑️", key=f"del_{idx}", help=f"Hapus {sheet_name}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    c1, c2 = st.columns(2)
+                    if c1.button("✅", key=f"yes_{idx}", help="Yakin"):
+                        delete_history_entry(gs, sheet_name, timestamp)
+                        st.session_state[confirm_key] = False
+                        st.rerun()
+                    if c2.button("❌", key=f"no_{idx}", help="Batal"):
+                        st.session_state[confirm_key] = False
+                        st.rerun()
+
+            # Tampilkan konfirmasi
+            if st.session_state[confirm_key]:
+                st.warning(f"⚠️ Yakin hapus **{sheet_name}**? Ini akan hapus sheet hasil, log, dan data review manual terkait.")
+
+    except Exception as e:
+        st.error(f"Error load riwayat: {e}")
+
+
+def delete_history_entry(gs, sheet_name, timestamp):
+    """Hapus sheet hasil + log + review manual."""
+    try:
+        with st.spinner(f"Menghapus {sheet_name}..."):
+            # 1. Hapus sheet hasil
+            deleted_sheet = gs.delete_sheet(sheet_name)
+            # 2. Hapus baris di log_upload yang sheet_hasil == sheet_name
+            deleted_log = gs.delete_rows_by_column("log_upload", "sheet_hasil", sheet_name)
+            # 3. Hapus review_manual dengan timestamp yang sama
+            deleted_review = gs.delete_rows_by_column("review_manual", "timestamp", timestamp)
+
+        msg = f"✅ Terhapus: sheet ({'ya' if deleted_sheet else 'tidak ada'}), log ({deleted_log} baris), review ({deleted_review} baris)"
+        st.success(msg)
+    except Exception as e:
+        st.error(f"❌ Gagal hapus: {e}")
+
+
 def show_results(result, filename, couriers, weight):
-    """Tampilkan hasil proses."""
     df_hasil = result["df_hasil"]
     df_review = result["df_review"]
     summary = result["summary"]
@@ -224,45 +260,37 @@ def show_results(result, filename, couriers, weight):
     st.markdown("---")
     st.markdown("### 3. 📊 Ringkasan Hasil")
 
-    # Metric
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("📦 Total Order", len(df_hasil))
     col2.metric("✅ Berhasil", len(df_hasil) - len(df_review))
     col3.metric("⚠️ Perlu Review", len(df_review))
     col4.metric("🔔 Tie Warning", len(notifications))
 
-    # Per gudang
-    st.markdown("#### 🏢 Distribusi per Gudang:")
-    cols = st.columns(len(summary)) if summary else [st.container()]
-    for i, (gudang, count) in enumerate(summary.items()):
-        with cols[i % len(cols)]:
-            st.metric(gudang, f"{count} order")
+    if summary:
+        st.markdown("#### 🏢 Distribusi per Gudang:")
+        cols = st.columns(len(summary))
+        for i, (gudang, count) in enumerate(summary.items()):
+            with cols[i % len(cols)]:
+                st.metric(gudang, f"{count} order")
 
-    # Notifikasi tie
     if notifications:
-        with st.expander(f"🔔 {len(notifications)} Notifikasi Ongkir Sama (klik untuk detail)"):
+        with st.expander(f"🔔 {len(notifications)} Notifikasi Ongkir Sama"):
             for n in notifications:
                 st.warning(f"**Order {n['order_id']}** - {n['nama_pembeli']}")
                 st.caption(n["warning"])
-                opsi_df = pd.DataFrame(n["opsi"])
-                st.dataframe(opsi_df, use_container_width=True)
-                st.markdown("---")
+                st.dataframe(pd.DataFrame(n["opsi"]), use_container_width=True)
 
-    # Review manual
     if not df_review.empty:
         st.markdown("#### ⚠️ Order Perlu Review Manual:")
         st.dataframe(df_review, use_container_width=True)
 
-    # Tabel hasil
     st.markdown("#### 📋 Hasil Lengkap:")
     st.dataframe(df_hasil, use_container_width=True, height=400)
 
-    # Tombol aksi
     st.markdown("---")
     st.markdown("### 4. 💾 Simpan & Download")
 
     col1, col2 = st.columns(2)
-
     with col1:
         st.download_button(
             label="📥 Download Excel",
@@ -271,44 +299,44 @@ def show_results(result, filename, couriers, weight):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-
     with col2:
         if st.button("☁️ Simpan ke Google Sheets", type="primary", use_container_width=True):
-            save_to_gsheets(df_hasil, df_review, filename, couriers, weight)
+            save_to_gsheets(df_hasil, df_review, filename)
 
 
-def save_to_gsheets(df_hasil, df_review, filename, couriers, weight):
-    """Simpan hasil ke GSheets: sheet baru + log + review."""
+def save_to_gsheets(df_hasil, df_review, filename):
     try:
         gs = get_gsheets_client()
         now = datetime.now()
         sheet_name = f"hasil_{now.strftime('%Y-%m-%d')}"
-
-        # Kalau sheet udah ada (upload 2x sehari), bikin versi jam
         if gs.sheet_exists(sheet_name):
             sheet_name = f"hasil_{now.strftime('%Y-%m-%d_%H%M')}"
 
         with st.spinner("Menyimpan ke Google Sheets..."):
-            # 1. Buat sheet hasil
-            gs.create_or_replace_sheet(sheet_name, df_hasil)
-
-            # 2. Append ke log_upload
+            new_ws = gs.create_or_replace_sheet(sheet_name, df_hasil)
+            # Buat hyperlink ke sheet tujuan
+            sheet_id = gs.spreadsheet.id
+            try:
+                gid = gs.spreadsheet.worksheet(sheet_name).id
+                sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={gid}"
+                sheet_link = f'=HYPERLINK("{sheet_url}";"{sheet_name}")'
+            except Exception:
+                sheet_link = sheet_name
+            timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
             gs.append_row("log_upload", [
-                now.strftime("%Y-%m-%d %H:%M:%S"),
+                timestamp_str,
                 st.session_state.get("username", "admin"),
                 filename,
                 len(df_hasil),
                 len(df_hasil) - len(df_review),
                 len(df_review),
-                sheet_name,
+                sheet_link,
             ])
-
-            # 3. Append review manual kalau ada
             if not df_review.empty:
                 rows = []
                 for _, r in df_review.iterrows():
                     rows.append([
-                        now.strftime("%Y-%m-%d %H:%M:%S"),
+                        timestamp_str,
                         str(r.get("order_id", "")),
                         str(r.get("nama_pembeli", "")),
                         str(r.get("kota_tujuan", "")),
@@ -320,12 +348,10 @@ def save_to_gsheets(df_hasil, df_review, filename, couriers, weight):
 
         st.success(f"✅ Tersimpan ke sheet: **{sheet_name}**")
         st.balloons()
-
     except Exception as e:
-        st.error(f"❌ Gagal simpan ke GSheets: {e}")
+        st.error(f"❌ Gagal: {e}")
 
 
-# ===== ENTRY =====
 def main():
     if login_page():
         main_app()
