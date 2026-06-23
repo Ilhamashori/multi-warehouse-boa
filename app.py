@@ -239,6 +239,18 @@ def main_app():
 
     with tab3:
         st.markdown("### ⚙️ Pengaturan")
+
+        # Link ke Google Sheets database
+        try:
+            sheet_id = st.secrets["gsheets"]["spreadsheet_id"]
+            gs_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+            st.markdown("#### 🔗 Database Google Sheets")
+            st.markdown(f"[📊 Buka Google Sheets]({gs_url})")
+            st.caption(gs_url)
+            st.markdown("---")
+        except Exception as e:
+            st.warning(f"Tidak bisa baca spreadsheet_id dari secrets: {e}")
+
         try:
             config = load_config()
             st.markdown("#### Config Saat Ini:")
