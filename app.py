@@ -40,11 +40,12 @@ def get_gsheets_client():
 def get_rajaongkir_api():
     cfg = st.secrets["rajaongkir"]
     key = cfg["api_key"]
-    # Opsional di secrets.toml: throttle_detik, max_retry
+    # Default aman 0.3 dtk (pas buat ~250 order). Bisa dioverride di
+    # secrets.toml [rajaongkir] throttle_detik = 0.5 kalau masih kena limit.
     try:
-        throttle = float(cfg.get("throttle_detik", 0.0))
+        throttle = float(cfg.get("throttle_detik", 0.3))
     except Exception:
-        throttle = 0.0
+        throttle = 0.3
     try:
         max_retry = int(cfg.get("max_retry", 4))
     except Exception:
@@ -121,7 +122,29 @@ def main_app():
                 st.success(f"✅ {n_aktif} gudang aktif")
         except Exception as e:
             st.error(f"❌ Error load gudang: {e}")
+
+        st.markdown("---")
+        st.markdown("### ⚡ Kecepatan")
+        pakai_mapping = st.checkbox(
+            "Mapping provinsi (cepat, tanpa API)", value=True,
+            help="Tentukan gudang dari provinsi tujuan. Lampung→Tangerang, Sumatra→Medan, "
+                 "Jawa/Bali→Tangerang, Kalimantan/Sulawesi/Papua→Makassar. "
+                 "Order yang provinsinya aneh otomatis pakai RajaOngkir.",
+        )
+        hitung_ongkir = st.checkbox(
+            "Hitung ongkir (butuh API, lebih lambat)", value=False,
+            help="OFF = super cepat, kolom ongkir kosong. ON = ambil ongkir dari RajaOngkir "
+                 "untuk gudang yang sudah dipilih.",
+        )
+        workers = st.slider(
+            "Proses paralel (workers)", 1, 10, 5,
+            help="Cuma berpengaruh kalau ada panggilan API (ongkir ON / fallback).",
+        )
+        st.caption("Tercepat: mapping ON + ongkir OFF (nyaris tanpa API).")
     st.session_state["active_wh_map"] = active_map
+    st.session_state["paralel_workers"] = workers
+    st.session_state["pakai_mapping"] = pakai_mapping
+    st.session_state["hitung_ongkir"] = hitung_ongkir
 
     try:
         config = load_config()
@@ -169,6 +192,12 @@ def main_app():
                     st.info("🏢 Gudang dipakai: " +
                             ", ".join(warehouses_aktif["nama_gudang"].tolist()))
 
+                    workers = int(st.session_state.get("paralel_workers", 5))
+                    # Mode paralel: matikan throttle (laju dibatasi jumlah workers).
+                    # Mode serial (workers=1): pakai throttle bawaan API.
+                    if workers > 1:
+                        api.throttle = 0.0
+
                     progress_bar = st.progress(0.0)
                     status_text = st.empty()
 
@@ -176,7 +205,7 @@ def main_app():
                         progress_bar.progress(min(max(pct, 0.0), 1.0))
                         status_text.text(msg)
 
-                    with st.spinner("Memproses..."):
+                    with st.spinner(f"Memproses ({workers} paralel)..."):
                         result = process_all_orders(
                             df_orders=df_orders,
                             warehouses=warehouses_aktif,
@@ -184,6 +213,9 @@ def main_app():
                             weight_gram=weight_input,
                             couriers=couriers,
                             progress_callback=update_progress,
+                            workers=workers,
+                            pakai_mapping=bool(st.session_state.get("pakai_mapping", True)),
+                            hitung_ongkir=bool(st.session_state.get("hitung_ongkir", False)),
                         )
                     progress_bar.empty()
                     status_text.empty()

@@ -14,6 +14,7 @@ import math
 import time
 import pandas as pd
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from modules.rajaongkir import RajaOngkirAPI
 
 
@@ -69,6 +70,42 @@ def is_valid_order(row):
 def _clean_city(city):
     return (str(city).replace("Kota", "").replace("Kabupaten", "")
             .replace("Kab.", "").replace("Adm.", "").strip())
+
+
+def assign_warehouse_by_province(province):
+    """Tentukan nama gudang dari PROVINSI tujuan (tanpa API).
+    Return nama_gudang, atau None kalau provinsi kosong/tak dikenal (→ fallback API).
+
+    Aturan (final, sesuai kesepakatan):
+      - Lampung                                  -> Tangerang
+      - Sumatra selain Lampung (Sumut/Aceh/Sumbar/
+        Riau/Kepri/Jambi/Sumsel/Bengkulu/Babel)  -> Medan
+      - Jawa/Bali/Banten/DKI/Yogya/NTB/NTT       -> Tangerang
+      - Kalimantan (semua)                       -> Makassar
+      - Sulawesi/Gorontalo/Maluku/Papua          -> Makassar
+    """
+    p = str(province).lower().strip()
+    if not p or p in ("nan", "none"):
+        return None
+
+    if "lampung" in p:
+        return "Tangerang"
+
+    sumatra_kw = ["sumatera", "sumatra", "aceh", "riau", "kepri", "jambi",
+                  "bengkulu", "bangka", "belitung", "nanggroe"]
+    if any(k in p for k in sumatra_kw):
+        return "Medan"
+
+    timur_kw = ["kalimantan", "sulawesi", "gorontalo", "maluku", "papua"]
+    if any(k in p for k in timur_kw):
+        return "Makassar"
+
+    barat_kw = ["jawa", "jakarta", "dki", "banten", "bali", "yogya", "diy",
+                "nusa tenggara", "ntt", "ntb"]
+    if any(k in p for k in barat_kw):
+        return "Tangerang"
+
+    return None  # tak dikenal → fallback ke RajaOngkir (hybrid)
 
 
 def find_destination_id(api, row):
@@ -170,8 +207,41 @@ def calculate_best_warehouse(api, row, warehouses, destination, weight_gram, cou
             "tie_warning": tie_warning, "notes": "OK"}
 
 
-def _process_one(api, row, warehouses, weight_gram, couriers):
-    """Proses 1 order. Return dict outcome."""
+def _process_one(api, row, warehouses, weight_gram, couriers,
+                 pakai_mapping=True, hitung_ongkir=True, active_names=None):
+    """Proses 1 order.
+    Urutan: mapping provinsi (cepat, no/low API) -> fallback RajaOngkir (hybrid)."""
+    if active_names is None:
+        active_names = set(warehouses["nama_gudang"].tolist())
+
+    # --- Jalur cepat: mapping provinsi ---
+    if pakai_mapping:
+        target = assign_warehouse_by_province(row.get("province"))
+        if target and target in active_names:
+            if not hitung_ongkir:
+                # gudang sudah pasti dari provinsi → tanpa API sama sekali
+                return {"status": "ok_map", "gudang": target,
+                        "ongkir": "", "kurir": "(mapping provinsi)"}
+            # ambil ongkir untuk gudang itu SAJA (bukan semua gudang)
+            destination, had_error = find_destination_id(api, row)
+            if destination:
+                wh_row = warehouses[warehouses["nama_gudang"] == target].iloc[0]
+                origin_id = wh_row.get("subdistrict_id")
+                services = []
+                if origin_id is not None and not pd.isna(origin_id):
+                    services = api.calculate_cost(int(origin_id), int(destination["id"]),
+                                                  weight_gram, couriers)
+                cheapest = get_cheapest_service(services)
+                if cheapest:
+                    return {"status": "ok_map", "gudang": target,
+                            "ongkir": int(cheapest["cost"]),
+                            "kurir": f"{cheapest.get('code','').upper()} "
+                                     f"{cheapest.get('service','')} ({cheapest.get('etd','')})"}
+            # gudang sudah jelas dari provinsi, ongkir gagal → tetap assign gudangnya
+            return {"status": "ok_map", "gudang": target, "ongkir": "",
+                    "kurir": "(mapping provinsi)"}
+
+    # --- Fallback hybrid: RajaOngkir cari gudang termurah ---
     destination, had_error = find_destination_id(api, row)
     if not destination:
         return {"status": "no_dest", "had_error": had_error}
@@ -181,38 +251,75 @@ def _process_one(api, row, warehouses, weight_gram, couriers):
     return {"status": "ok", "best": calc["best_warehouse"], "calc": calc}
 
 
+def _run_batch(api, df_valid, idx_list, warehouses, weight_gram, couriers,
+               workers, progress_callback, label, pakai_mapping=True,
+               hitung_ongkir=True, active_names=None):
+    """Jalankan _process_one untuk sekumpulan index. Paralel kalau workers>1.
+    Progress HANYA di-update dari thread utama (aman buat Streamlit)."""
+    outcomes = {}
+    total = len(idx_list)
+    if total == 0:
+        return outcomes
+
+    def _job(idx):
+        return _process_one(api, df_valid.loc[idx], warehouses, weight_gram, couriers,
+                            pakai_mapping=pakai_mapping, hitung_ongkir=hitung_ongkir,
+                            active_names=active_names)
+
+    if workers <= 1:  # mode serial
+        for n, idx in enumerate(idx_list):
+            outcomes[idx] = _job(idx)
+            if progress_callback:
+                progress_callback((n + 1) / total, f"{label} {n + 1}/{total}")
+        return outcomes
+
+    # mode paralel
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_job, idx): idx for idx in idx_list}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                outcomes[idx] = fut.result()
+            except Exception as e:
+                outcomes[idx] = {"status": "no_dest", "had_error": True, "err": str(e)}
+            done += 1
+            if progress_callback:
+                progress_callback(done / total, f"{label} {done}/{total}")
+    return outcomes
+
+
 def process_all_orders(df_orders, warehouses, api, weight_gram=1000,
-                       couriers="jne:tiki", progress_callback=None, retry_delay=5.0):
+                       couriers="jne:tiki", progress_callback=None,
+                       retry_delay=5.0, workers=5,
+                       pakai_mapping=True, hitung_ongkir=True):
     # FILTER: hanya order dengan order_id numerik valid DAN city ada
     df_orders = df_orders.reset_index(drop=True)
     mask = df_orders.apply(is_valid_order, axis=1)
     df_valid = df_orders[mask].reset_index(drop=True)
     baris_skipped = len(df_orders) - len(df_valid)
 
-    total = len(df_valid)
-    outcomes = {}
-    retry_idx = []
+    all_idx = list(df_valid.index)
+    active_names = set(warehouses["nama_gudang"].tolist())
 
     # --- Pass 1 ---
-    for idx, row in df_valid.iterrows():
-        if progress_callback:
-            progress_callback((idx + 1) / max(total, 1), f"Proses order {idx + 1}/{total}")
-        out = _process_one(api, row, warehouses, weight_gram, couriers)
-        outcomes[idx] = out
-        if out["status"] == "no_dest" and out.get("had_error"):
-            retry_idx.append(idx)
+    outcomes = _run_batch(api, df_valid, all_idx, warehouses, weight_gram, couriers,
+                          workers, progress_callback, "Proses",
+                          pakai_mapping=pakai_mapping, hitung_ongkir=hitung_ongkir,
+                          active_names=active_names)
 
-    # --- Pass 2: retry yang gagal gara-gara error transient (rate limit/timeout) ---
+    # --- Pass 2: retry yang gagal gara-gara error transient ---
+    retry_idx = [idx for idx in all_idx
+                 if outcomes[idx]["status"] == "no_dest" and outcomes[idx].get("had_error")]
     if retry_idx:
         if progress_callback:
-            progress_callback(1.0, f"Retry {len(retry_idx)} order yang sempat error API...")
+            progress_callback(0.0, f"Retry {len(retry_idx)} order yang sempat error API...")
         time.sleep(retry_delay)
-        for n, idx in enumerate(retry_idx):
-            if progress_callback:
-                progress_callback((n + 1) / len(retry_idx),
-                                  f"Retry {n + 1}/{len(retry_idx)}")
-            out = _process_one(api, df_valid.loc[idx], warehouses, weight_gram, couriers)
-            outcomes[idx] = out
+        retry_out = _run_batch(api, df_valid, retry_idx, warehouses, weight_gram, couriers,
+                               workers, progress_callback, "Retry",
+                               pakai_mapping=pakai_mapping, hitung_ongkir=hitung_ongkir,
+                               active_names=active_names)
+        outcomes.update(retry_out)
 
     # --- Assemble hasil ---
     results, review_manual, notifications = [], [], []
@@ -234,6 +341,12 @@ def process_all_orders(df_orders, warehouses, api, weight_gram=1000,
                     "warning": calc["tie_warning"],
                     "opsi": calc["all_options"],
                 })
+
+        elif out["status"] == "ok_map":
+            row_dict["_gudang_rekomendasi"] = out["gudang"]
+            row_dict["_ongkir_rekomendasi"] = out.get("ongkir", "")
+            row_dict["_kurir_rekomendasi"] = out.get("kurir", "")
+            row_dict["_catatan"] = "OK (mapping provinsi)"
 
         elif out["status"] == "no_wh":
             row_dict["_gudang_rekomendasi"] = "TIDAK ADA"

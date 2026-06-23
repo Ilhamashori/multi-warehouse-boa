@@ -1,17 +1,17 @@
 """
-RajaOngkir API V2 (via Komerce) wrapper — dengan cache, retry, dan backoff.
+RajaOngkir API V2 (via Komerce) wrapper — cache + retry + backoff + thread-safe.
 
-Perubahan penting vs versi lama:
-- Setiap request HTTP sekarang punya RETRY + exponential backoff.
-- Status 429 (rate limit) di-handle khusus: hormati header Retry-After kalau ada,
-  kalau nggak pakai backoff. Ini yang dulu bikin order kena REVIEW MANUAL palsu.
-- Ada throttle opsional (jeda antar call) biar nggak nge-gas API.
-- Error API dibedakan dari "data kosong" lewat flag is_hard_error, jadi caller
-  bisa retry yang error tanpa keburu cap "Destinasi tidak ditemukan".
+Perubahan vs versi lama:
+- Retry + exponential backoff per request; handle 429 (rate limit) khusus.
+- Throttle opsional (jeda antar call) untuk mode serial.
+- THREAD-SAFE: cache & counter dilindungi lock, jadi aman dipanggil paralel
+  (banyak order sekaligus pakai ThreadPoolExecutor).
+- Error API dibedakan dari "data kosong" lewat flag is_hard_error.
 """
 import requests
 import time
 import random
+import threading
 from typing import Optional
 
 
@@ -24,51 +24,51 @@ class RajaOngkirAPI:
             raise ValueError("API key RajaOngkir tidak boleh kosong")
         self.api_key = api_key
         self.timeout = timeout
-        self.max_retry = max_retry          # jumlah retry tambahan per call
-        self.throttle = throttle            # jeda minimum antar call (detik)
+        self.max_retry = max_retry
+        self.throttle = throttle            # jeda antar call (dipakai mode serial)
         self.headers = {"key": api_key}
-        # Cache in-memory
-        self._cache_destination = {}        # keyword -> list destinations
-        self._cache_cost = {}               # (origin,dest,weight,couriers,sort) -> services
-        # Counter buat monitoring
+        self._cache_destination = {}
+        self._cache_cost = {}
         self.hits = 0
         self.cache_hits = 0
-        self.errors = 0                     # call yang gagal SETELAH semua retry
+        self.errors = 0
         self._last_call = 0.0
+        self._lock = threading.Lock()       # lindungi cache + counter
 
     # ---------- internal ----------
     def _sleep_throttle(self):
         if self.throttle > 0:
-            wait = self.throttle - (time.time() - self._last_call)
+            with self._lock:
+                wait = self.throttle - (time.time() - self._last_call)
+                self._last_call = time.time() + (wait if wait > 0 else 0)
             if wait > 0:
                 time.sleep(wait)
-        self._last_call = time.time()
 
     def _request(self, method, url, **kwargs):
-        """HTTP request dengan retry + backoff.
-        Return (payload_dict | None, is_hard_error: bool).
-        is_hard_error=True => gagal karena API/jaringan (BUKAN data kosong).
-        """
+        """HTTP request + retry/backoff. Return (payload|None, is_hard_error)."""
         for attempt in range(self.max_retry + 1):
             self._sleep_throttle()
             try:
                 r = requests.request(method, url, timeout=self.timeout, **kwargs)
-                self.hits += 1
+                with self._lock:
+                    self.hits += 1
 
-                if r.status_code == 429:  # rate limit
+                if r.status_code == 429:
                     ra = r.headers.get("Retry-After", "")
                     wait = float(ra) if str(ra).strip().isdigit() else (2 ** attempt)
                     if attempt < self.max_retry:
                         time.sleep(wait + random.uniform(0, 0.5))
                         continue
-                    self.errors += 1
+                    with self._lock:
+                        self.errors += 1
                     return None, True
 
-                if 500 <= r.status_code < 600:  # server error → layak retry
+                if 500 <= r.status_code < 600:
                     if attempt < self.max_retry:
                         time.sleep((2 ** attempt) + random.uniform(0, 0.5))
                         continue
-                    self.errors += 1
+                    with self._lock:
+                        self.errors += 1
                     return None, True
 
                 r.raise_for_status()
@@ -78,7 +78,8 @@ class RajaOngkirAPI:
                 if attempt < self.max_retry:
                     time.sleep((2 ** attempt) + random.uniform(0, 0.5))
                     continue
-                self.errors += 1
+                with self._lock:
+                    self.errors += 1
                 print(f"[RajaOngkir] gagal {method} {url} setelah {self.max_retry + 1}x: {e}")
                 return None, True
         return None, True
@@ -87,29 +88,31 @@ class RajaOngkirAPI:
     def _search(self, keyword: str, limit: int = 10):
         """Cari destinasi. Return (list, is_hard_error)."""
         key = f"{str(keyword).lower().strip()}_{limit}"
-        if key in self._cache_destination:
-            self.cache_hits += 1
-            return self._cache_destination[key], False
+        with self._lock:
+            if key in self._cache_destination:
+                self.cache_hits += 1
+                return self._cache_destination[key], False
         url = f"{self.BASE_URL}/destination/domestic-destination"
         params = {"search": keyword, "limit": limit, "offset": 0}
         payload, hard_err = self._request("GET", url, headers=self.headers, params=params)
         if payload is None:
-            return [], hard_err     # JANGAN cache hasil error
+            return [], hard_err
         result = payload.get("data", []) or []
-        self._cache_destination[key] = result
+        with self._lock:
+            self._cache_destination[key] = result
         return result, False
 
     def search_destination(self, keyword: str, limit: int = 10) -> list:
-        """Kompat lama: balikin list aja."""
         result, _ = self._search(keyword, limit)
         return result
 
     def calculate_cost(self, origin_id, destination_id, weight_gram,
                        couriers="jne:tiki", price_sort="lowest") -> list:
         key = (int(origin_id), int(destination_id), int(weight_gram), couriers, price_sort)
-        if key in self._cache_cost:
-            self.cache_hits += 1
-            return self._cache_cost[key]
+        with self._lock:
+            if key in self._cache_cost:
+                self.cache_hits += 1
+                return self._cache_cost[key]
         url = f"{self.BASE_URL}/calculate/domestic-cost"
         data = {
             "origin": str(origin_id),
@@ -121,9 +124,10 @@ class RajaOngkirAPI:
         headers = {**self.headers, "Content-Type": "application/x-www-form-urlencoded"}
         payload, hard_err = self._request("POST", url, headers=headers, data=data)
         if payload is None:
-            return []               # gagal → kosong, JANGAN cache
+            return []
         result = payload.get("data", []) or []
-        self._cache_cost[key] = result
+        with self._lock:
+            self._cache_cost[key] = result
         return result
 
     def find_destination_by_zip(self, zip_code: str) -> Optional[dict]:
