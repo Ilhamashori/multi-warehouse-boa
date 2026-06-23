@@ -1,7 +1,17 @@
 """
 Logic inti: hitung gudang termurah per order.
+
+Perubahan penting vs versi lama:
+- find_destination_id() sekarang balikin (destination, had_error). had_error=True
+  artinya cek destinasi sempat kena error API/rate-limit (bukan beneran nggak ada).
+- find_destination_id() lebih tahan banting: zip -> subdistrict(+city) -> subdistrict
+  -> city, dengan normalisasi nama kota (buang "Kota"/"Kab."/"Kabupaten").
+- process_all_orders() punya RETRY PASS: order yang gagal gara-gara error transient
+  dikumpulin, dijeda sebentar, lalu diproses ulang. Cuma yang BENER-BENER gagal
+  setelah retry yang masuk REVIEW MANUAL.
 """
 import math
+import time
 import pandas as pd
 from typing import Optional
 from modules.rajaongkir import RajaOngkirAPI
@@ -56,32 +66,58 @@ def is_valid_order(row):
     return True
 
 
+def _clean_city(city):
+    return (str(city).replace("Kota", "").replace("Kabupaten", "")
+            .replace("Kab.", "").replace("Adm.", "").strip())
+
+
 def find_destination_id(api, row):
+    """Cari ID destinasi RajaOngkir. Return (destination_dict | None, had_error: bool)."""
+    had_error = False
+
+    # 1) by ZIP (paling akurat)
     zip_code = row.get("zip")
     if zip_code and str(zip_code).strip() not in ("", "nan", "None"):
         zip_str = str(zip_code).replace(".0", "").strip()
         if zip_str.isdigit() and len(zip_str) <= 5:
             zip_str = zip_str.zfill(5)
-            result = api.find_destination_by_zip(zip_str)
-            if result:
-                return result
+            results, err = api._search(zip_str, limit=10)
+            had_error = had_error or err
+            if results:
+                for r in results:
+                    if str(r.get("zip_code")) == zip_str:
+                        return r, had_error
+                return results[0], had_error
+
+    city_clean = _clean_city(row.get("city", ""))
+
+    # 2) by subdistrict (difilter city kalau ada)
     subdistrict = row.get("subdistrict")
     if subdistrict and str(subdistrict).strip() not in ("", "nan", "None"):
-        results = api.search_destination(str(subdistrict).strip(), limit=5)
+        sub = str(subdistrict).strip()
+        results, err = api._search(sub, limit=10)
+        had_error = had_error or err
         if results:
-            city = str(row.get("city", "")).strip().lower()
-            if city:
+            if city_clean:
                 for r in results:
-                    if city in str(r.get("city_name", "")).lower():
-                        return r
-            return results[0]
-    city = row.get("city")
-    if city and str(city).strip() not in ("", "nan", "None"):
-        city_clean = str(city).replace("Kota", "").replace("Kab.", "").replace("Kabupaten", "").strip()
-        results = api.search_destination(city_clean, limit=5)
+                    if city_clean.lower() in str(r.get("city_name", "")).lower():
+                        return r, had_error
+            return results[0], had_error
+        # gabung subdistrict + city
+        if city_clean:
+            results, err = api._search(f"{sub} {city_clean}", limit=10)
+            had_error = had_error or err
+            if results:
+                return results[0], had_error
+
+    # 3) by city aja
+    if city_clean:
+        results, err = api._search(city_clean, limit=10)
+        had_error = had_error or err
         if results:
-            return results[0]
-    return None
+            return results[0], had_error
+
+    return None, had_error
 
 
 def calculate_best_warehouse(api, row, warehouses, destination, weight_gram, couriers):
@@ -127,59 +163,65 @@ def calculate_best_warehouse(api, row, warehouses, destination, weight_gram, cou
     tied = [o for o in all_options if o["ongkir"] == best["ongkir"]]
     if len(tied) > 1:
         gudang_tied = [o["nama_gudang"] for o in tied]
-        tie_warning = f"⚠️ Ongkir sama ({best['ongkir']:,}) di {len(tied)} gudang: {', '.join(gudang_tied)}. Dipilih {best['nama_gudang']} (prioritas #{best['prioritas']})"
+        tie_warning = (f"⚠️ Ongkir sama ({best['ongkir']:,}) di {len(tied)} gudang: "
+                       f"{', '.join(gudang_tied)}. Dipilih {best['nama_gudang']} "
+                       f"(prioritas #{best['prioritas']})")
     return {"best_warehouse": best, "all_options": all_options,
             "tie_warning": tie_warning, "notes": "OK"}
 
 
-def process_all_orders(df_orders, warehouses, api, weight_gram=1000, couriers="jne:tiki", progress_callback=None):
+def _process_one(api, row, warehouses, weight_gram, couriers):
+    """Proses 1 order. Return dict outcome."""
+    destination, had_error = find_destination_id(api, row)
+    if not destination:
+        return {"status": "no_dest", "had_error": had_error}
+    calc = calculate_best_warehouse(api, row, warehouses, destination, weight_gram, couriers)
+    if not calc["best_warehouse"]:
+        return {"status": "no_wh", "calc": calc}
+    return {"status": "ok", "best": calc["best_warehouse"], "calc": calc}
+
+
+def process_all_orders(df_orders, warehouses, api, weight_gram=1000,
+                       couriers="jne:tiki", progress_callback=None, retry_delay=5.0):
     # FILTER: hanya order dengan order_id numerik valid DAN city ada
     df_orders = df_orders.reset_index(drop=True)
     mask = df_orders.apply(is_valid_order, axis=1)
     df_valid = df_orders[mask].reset_index(drop=True)
     baris_skipped = len(df_orders) - len(df_valid)
 
-    results, review_manual, notifications = [], [], []
     total = len(df_valid)
+    outcomes = {}
+    retry_idx = []
 
+    # --- Pass 1 ---
     for idx, row in df_valid.iterrows():
         if progress_callback:
             progress_callback((idx + 1) / max(total, 1), f"Proses order {idx + 1}/{total}")
-        destination = find_destination_id(api, row)
+        out = _process_one(api, row, warehouses, weight_gram, couriers)
+        outcomes[idx] = out
+        if out["status"] == "no_dest" and out.get("had_error"):
+            retry_idx.append(idx)
+
+    # --- Pass 2: retry yang gagal gara-gara error transient (rate limit/timeout) ---
+    if retry_idx:
+        if progress_callback:
+            progress_callback(1.0, f"Retry {len(retry_idx)} order yang sempat error API...")
+        time.sleep(retry_delay)
+        for n, idx in enumerate(retry_idx):
+            if progress_callback:
+                progress_callback((n + 1) / len(retry_idx),
+                                  f"Retry {n + 1}/{len(retry_idx)}")
+            out = _process_one(api, df_valid.loc[idx], warehouses, weight_gram, couriers)
+            outcomes[idx] = out
+
+    # --- Assemble hasil ---
+    results, review_manual, notifications = [], [], []
+    for idx, row in df_valid.iterrows():
+        out = outcomes[idx]
         row_dict = row.to_dict()
 
-        if not destination:
-            review_manual.append({
-                "order_id": row.get("order_id", ""),
-                "nama_pembeli": row.get("name", row.get("Nama lengkap", "")),
-                "kota_tujuan": row.get("city", ""),
-                "subdistrict": row.get("subdistrict", ""),
-                "zip": row.get("zip", ""),
-                "alasan": "Destinasi tidak ditemukan di RajaOngkir",
-            })
-            row_dict["_gudang_rekomendasi"] = "REVIEW MANUAL"
-            row_dict["_ongkir_rekomendasi"] = ""
-            row_dict["_kurir_rekomendasi"] = ""
-            row_dict["_catatan"] = "Destinasi tidak ditemukan"
-            results.append(row_dict)
-            continue
-
-        calc = calculate_best_warehouse(api, row, warehouses, destination, weight_gram, couriers)
-        best = calc["best_warehouse"]
-        if not best:
-            row_dict["_gudang_rekomendasi"] = "TIDAK ADA"
-            row_dict["_ongkir_rekomendasi"] = ""
-            row_dict["_kurir_rekomendasi"] = ""
-            row_dict["_catatan"] = calc["notes"]
-            review_manual.append({
-                "order_id": row.get("order_id", ""),
-                "nama_pembeli": row.get("name", row.get("Nama lengkap", "")),
-                "kota_tujuan": row.get("city", ""),
-                "subdistrict": row.get("subdistrict", ""),
-                "zip": row.get("zip", ""),
-                "alasan": calc["notes"],
-            })
-        else:
+        if out["status"] == "ok":
+            best, calc = out["best"], out["calc"]
             row_dict["_gudang_rekomendasi"] = best["nama_gudang"]
             row_dict["_ongkir_rekomendasi"] = best["ongkir"]
             row_dict["_kurir_rekomendasi"] = f"{best['kurir']} {best['service']} ({best['etd']})"
@@ -192,6 +234,40 @@ def process_all_orders(df_orders, warehouses, api, weight_gram=1000, couriers="j
                     "warning": calc["tie_warning"],
                     "opsi": calc["all_options"],
                 })
+
+        elif out["status"] == "no_wh":
+            row_dict["_gudang_rekomendasi"] = "TIDAK ADA"
+            row_dict["_ongkir_rekomendasi"] = ""
+            row_dict["_kurir_rekomendasi"] = ""
+            row_dict["_catatan"] = out["calc"]["notes"]
+            review_manual.append({
+                "order_id": row.get("order_id", ""),
+                "nama_pembeli": row.get("name", row.get("Nama lengkap", "")),
+                "kota_tujuan": row.get("city", ""),
+                "subdistrict": row.get("subdistrict", ""),
+                "zip": row.get("zip", ""),
+                "alasan": out["calc"]["notes"],
+            })
+
+        else:  # no_dest
+            alasan = "Destinasi tidak ditemukan di RajaOngkir"
+            catatan = "Destinasi tidak ditemukan"
+            if out.get("had_error"):
+                alasan = "Gagal cek destinasi (error API/rate-limit) walau sudah retry — coba proses ulang"
+                catatan = "Error API (coba ulang)"
+            row_dict["_gudang_rekomendasi"] = "REVIEW MANUAL"
+            row_dict["_ongkir_rekomendasi"] = ""
+            row_dict["_kurir_rekomendasi"] = ""
+            row_dict["_catatan"] = catatan
+            review_manual.append({
+                "order_id": row.get("order_id", ""),
+                "nama_pembeli": row.get("name", row.get("Nama lengkap", "")),
+                "kota_tujuan": row.get("city", ""),
+                "subdistrict": row.get("subdistrict", ""),
+                "zip": row.get("zip", ""),
+                "alasan": alasan,
+            })
+
         results.append(row_dict)
 
     df_hasil = pd.DataFrame(results)
@@ -208,14 +284,16 @@ def process_all_orders(df_orders, warehouses, api, weight_gram=1000, couriers="j
         "_kurir_rekomendasi": "Kurir",
         "_catatan": "Catatan",
     })
-    # Sort: order berhasil duluan, REVIEW MANUAL / TIDAK ADA di akhir
+
     def sort_key(x):
         v = str(x).upper()
         if v in ("REVIEW MANUAL", "TIDAK ADA"):
             return (2, v)
         return (1, v)
-    df_hasil = df_hasil.sort_values(by="Gudang Rekomendasi", key=lambda s: s.map(sort_key)).reset_index(drop=True)
-    df_hasil.index = df_hasil.index + 1  # Mulai dari 1
+
+    df_hasil = df_hasil.sort_values(by="Gudang Rekomendasi",
+                                    key=lambda s: s.map(sort_key)).reset_index(drop=True)
+    df_hasil.index = df_hasil.index + 1
     summary = df_hasil.groupby("Gudang Rekomendasi").size().to_dict()
 
     return {"df_hasil": df_hasil, "df_review": pd.DataFrame(review_manual),
